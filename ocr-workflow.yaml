@@ -1,0 +1,167 @@
+description: "OCR workflow using tesseract or serverless code execution example for using a Golang container"
+
+# The start definition which starts the worklfow based on the event received from the
+# vault workflow. Example of the event is shown above in the description
+#
+start:
+  type: event
+  state: strip-event-data
+  event: 
+    type: "Microsoft.Storage.BlobCreated"
+
+functions:
+  - id: tesseract-ocr
+    image: wwonigkeit/tesseract-ocr:1.0
+    type: knative-workflow
+    size: large
+    
+  - id: http-request
+    image: gcr.io/direktiv/functions/http-request:1.0
+    type: knative-workflow
+
+  # Slack message container
+  - id: slack
+    image: gcr.io/direktiv/functions/slack:1.0
+    type: knative-workflow
+  
+  # Send email container
+  - id: send-email
+    image: gcr.io/direktiv/functions/sendmail:1.0
+    type: knative-workflow
+
+  # Function for the Microsoft Teams webhook message transport
+  - id: teams
+    image: gcr.io/direktiv/functions/teams:1.0
+    type: knative-workflow
+
+states:
+  - id: strip-event-data
+    type: noop
+    transform: jq(."Microsoft.Storage.BlobCreated".data)
+    transition: get-image
+
+  - id: get-image
+    type: action
+    action:
+      function: http-request
+      input:
+        url: jq(.url)
+        method: GET
+    transition: store-image
+
+  - id: store-image
+    type: setter
+    variables:
+    - key: image.png
+      scope: instance
+      mimeType: application/octet-stream
+      value: jq(.return[0].result)
+    transition: tesseract-ocr
+
+  - id: tesseract-ocr
+    type: action
+    action:
+      function: tesseract-ocr
+      files:
+      - key: image.png
+        scope: instance
+      input:
+        commands:
+        - command: tesseract image.png stdout
+    transition: store-text
+    transform: 'jq( . += { ocrtext: .return."tesseract-ocr"[0].result } | del(.return) )'
+
+  - id: store-text
+    type: setter
+    variables:
+    - key: text.txt
+      scope: workflow
+      mimeType: text/plain
+      value: 'jq(.ocrtext)'
+    transition: slack-message
+
+  #
+  # Send a slack message with the kubeconfig file attached
+  #
+  - id: slack-message
+    log: Send a slack message
+    type: action
+    action:
+      function: slack
+      secrets: ["SLACK_URL"]
+      input: 
+        webhook-url: jq(.secrets."SLACK_URL")
+        content:
+          blocks:
+          - type: section
+            text:
+              type: mrkdwn
+              text: '*Converted text:* ```jq(.ocrtext)```'
+            accessory:
+              type: image
+              image_url: jq(.url)
+              alt_text: "Original message"
+    transition: send-email
+  
+  #
+  # Send an unencrypted email message with the attachments.
+  #
+  - id: send-email
+    # log: jq(.)
+    log: Sending email to owner of the provisioned environment
+    type: action
+    action:
+      secrets: ["EMAIL_USER", "EMAIL_PASSWORD"]
+      files:
+      - key: text.txt
+        scope: workflow
+      function: send-email
+      input: 
+        smtp:
+          server: smtp.gmail.com:587
+          user: jq(.secrets.EMAIL_USER)
+          password: jq(.secrets.EMAIL_PASSWORD)
+        emails:
+        - from: equinix@direktiv.io
+          to:
+          - wwonigkeit@iqconsult.com.au
+          - cgrobbelaar@iqconsult.com.au
+          - matthewwebster@iqconsult.com.au
+          subject: 'Tesseract OCR conversion for jq(.url)'
+          message:
+            name: message
+            data: 'The attachment in this email is the OCR conversion for the following file jq(.url)'
+          attachments:
+          - text.txt=UTF-8
+          contentType: "text/plain"
+    transition: send-teams
+
+  #
+  # First state entry: send a message to Microsoft Teams
+  #
+  - id: send-teams
+    type: action
+    action:
+      function: teams
+      secrets: ["TEAMS_WEBHOOK_URL"]
+      input: 
+        webhook-url: jq(.secrets.TEAMS_WEBHOOK_URL)
+        verbose: true
+        content:
+          type: message
+          attachments:
+          - contentType: application/vnd.microsoft.card.adaptive
+            content:
+              "$schema": http://adaptivecards.io/schemas/adaptive-card.json
+              type: AdaptiveCard
+              version: '1.2'
+              body:
+              - type: TextBlock
+                size: Medium
+                weight: Bolder
+                text: Result from OCR image analysis
+                wrap: true
+              - type: FactSet
+                facts:
+                - title: Id
+                  value: jq(.ocrtext)  
